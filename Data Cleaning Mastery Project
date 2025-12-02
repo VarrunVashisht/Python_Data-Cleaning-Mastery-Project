@@ -1,0 +1,342 @@
+"""
+data_cleaning_pipeline.py
+
+Full end-to-end data cleaning pipeline for the "data_cleaning_challenge.csv" dataset.
+Copy-paste and run. Requires: pandas, numpy, python >=3.8.
+
+Outputs:
+- data_cleaning_challenge_cleaned.csv (cleaned dataframe)
+- prints diagnostics and sample rows to console
+"""
+
+import re
+import json
+from datetime import datetime
+import pandas as pd
+import numpy as np
+
+INPUT_CSV = "data_cleaning_challenge.csv"   # change if needed
+OUTPUT_CSV = "data_cleaning_challenge_cleaned.csv"
+
+# ----------------------
+# Utility parsing funcs
+# ----------------------
+def replace_null_like(df, null_like=None):
+    if null_like is None:
+        null_like = ["", "NA", "N/A", "null", "—"]
+    return df.replace(null_like, pd.NA)
+
+def parse_money(x):
+    """Attempt to extract numeric value from currency-like strings.
+       Handles parentheses as negative, $45k, €45000, '45000 USD', etc."""
+    if pd.isna(x):
+        return pd.NA
+    s = str(x).strip()
+    if s == "":
+        return pd.NA
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1]
+    # common thousands short-hand like "45k" or "$45k"
+    m_k = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*[kK]\b', s)
+    if m_k:
+        try:
+            val = float(m_k.group(1)) * 1000
+            return -val if neg else val
+        except:
+            pass
+    # remove currency symbols and letters, but keep digits, dot, minus
+    s2 = re.sub(r"[^0-9.\-]", "", s)
+    if s2 in ("", ".", "-", "-.", ".-"):
+        return pd.NA
+    try:
+        val = float(s2)
+        return -val if neg else val
+    except:
+        return pd.NA
+
+def parse_income(x):
+    """Parse income string into numeric value (no currency conversion here)."""
+    return parse_money(x)
+
+def parse_date_flexible(s):
+    """Try multiple strategies to parse a date string, return Timestamp or NaT.
+       Safe version without warnings from dayfirst=True/False conflicts."""
+    if pd.isna(s):
+        return pd.NaT
+    s = str(s).strip()
+    if s.lower() in ("", "nan", "na", "n/a", "null", "—"):
+        return pd.NaT
+
+    # Try common explicit formats first (no warnings)
+    fmts = [
+        "%Y-%m-%d", "%d/%m/%Y", "%d/%m/%Y %H:%M:%S",
+        "%m-%d-%y", "%b %d %Y", "%d %b %Y", "%d %b, %Y",
+        "%Y/%m/%d", "%d-%b-%Y"
+    ]
+    for f in fmts:
+        try:
+            return pd.to_datetime(s, format=f, errors='raise')
+        except:
+            pass
+
+    # fallback: let pandas guess quietly
+    try:
+        return pd.to_datetime(s, errors="coerce")
+    except:
+        return pd.NaT
+
+
+def normalize_bool_like(x):
+    if pd.isna(x):
+        return pd.NA
+    s = str(x).strip().lower()
+    if s in ('y', 'yes', '1', 'true', 't', 'subscribed'):
+        return True
+    if s in ('n', 'no', '0', 'false', 'f', 'unsubscribed'):
+        return False
+    return pd.NA
+
+EMAIL_RE = re.compile(r"^[A-Za-z0-9\._%+\-]+@[A-Za-z0-9\.\-]+\.[A-Za-z]{2,}$")
+def valid_email(e):
+    if pd.isna(e):
+        return False
+    s = str(e).strip()
+    if EMAIL_RE.match(s):
+        return True
+    return False
+
+def clean_name(s):
+    if pd.isna(s):
+        return pd.NA
+    s = str(s).strip()
+    if s == "":
+        return pd.NA
+    s = re.sub(r'\s+', ' ', s)
+    # if it looks like a header fragment, return NA (we will drop later)
+    if re.search(r'\bname\b.*signup_date', s, flags=re.IGNORECASE):
+        return "HEADER_FRAGMENT"
+    return s.title()
+
+def normalize_country(s):
+    if pd.isna(s):
+        return pd.NA
+    m = str(s).strip().lower()
+    mapping = {
+        'united states': 'United States', 'usa': 'United States', 'us': 'United States', 'united states of america': 'United States',
+        'uk':'United Kingdom','untied kingdom':'United Kingdom','united kingdom':'United Kingdom','gb':'United Kingdom',
+        'australia':'Australia','aus':'Australia',
+        'brazil':'Brazil','brasil':'Brazil',
+        'spain':'Spain','españa':'Spain',
+        'france':'France','deu':'Germany','germany':'Germany'
+    }
+    if m in mapping:
+        return mapping[m]
+    else:
+        return m.title() if m not in ("", "nan") else pd.NA
+
+def normalize_phone(s):
+    if pd.isna(s):
+        return pd.NA
+    s = str(s).strip()
+    if s == "":
+        return pd.NA
+    # keep plus sign and digits only
+    cleaned = re.sub(r"[^\d\+]", "", s)
+    if cleaned == "":
+        return pd.NA
+    return cleaned
+
+def remove_html_tags(s):
+    if pd.isna(s):
+        return pd.NA
+    s = str(s)
+    s = re.sub(r'<.*?>', '', s)  # naive removal
+    s = s.strip()
+    return s if s != "" else pd.NA
+
+# ----------------------
+# Cleaning pipeline
+# ----------------------
+def full_clean_pipeline(df_raw: pd.DataFrame) -> pd.DataFrame:
+    df = df_raw.copy()
+
+    # 0) Standardize missing / null-like values
+    df = replace_null_like(df)
+
+    # 1) Remove header-like rows embedded in data
+    df['name_clean_temp'] = df['name'].astype(str).apply(clean_name)
+    header_mask = df['name_clean_temp'] == "HEADER_FRAGMENT"
+    if header_mask.any():
+        df = df.loc[~header_mask].copy()
+    df.drop(columns=['name_clean_temp'], inplace=True, errors='ignore')
+
+    # 2) Drop exact full-row duplicates (keep first)
+    before = len(df)
+    df = df.drop_duplicates(ignore_index=True)
+    after = len(df)
+
+    # 3) Names: strip normalization
+    df['name'] = df['name'].apply(clean_name)
+
+    # 4) Dates: parse signup_date and last_login
+    df['signup_date_parsed'] = df['signup_date'].apply(parse_date_flexible)
+    df['last_login_parsed'] = df['last_login'].replace({'never': pd.NA}).apply(parse_date_flexible)
+
+    # 5) Age -> numeric
+    df['age_clean'] = pd.to_numeric(df['age'].astype(str).str.extract(r'(\d{1,3})', expand=False), errors='coerce')
+
+    # 6) Purchase amount and income numeric parsing
+    df['purchase_amount_clean'] = df['purchase_amount'].apply(parse_money)
+    df['income_clean'] = df['income'].apply(parse_income)
+
+    # 7) Preferred contact normalization
+    df['preferred_contact_clean'] = df['preferred_contact'].astype(str).str.strip().replace({'nan': pd.NA})
+    df['preferred_contact_clean'] = df['preferred_contact_clean'].str.lower().replace({
+        'email':'Email','e-mail':'Email','phone':'Phone','phone':'Phone'
+    })
+    df['preferred_contact_clean'] = df['preferred_contact_clean'].where(df['preferred_contact_clean'].isin(['Email','Phone']), pd.NA)
+
+    # 8) Subscription to boolean
+    df['subscription_bool'] = df['subscription'].apply(normalize_bool_like)
+
+    # 9) Country normalization
+    df['country_clean'] = df['country'].apply(normalize_country)
+
+    # 10) Email validation
+    df['email_valid'] = df['email'].apply(valid_email)
+    # keep valid email or NA
+    df['email_clean'] = df['email'].where(df['email_valid'], pd.NA)
+
+    # 11) Phone normalization
+    df['phone_clean'] = df['phone'].apply(normalize_phone)
+
+    # 12) Comments: strip html and whitespace
+    df['comments_clean'] = df['comments'].apply(remove_html_tags)
+
+    # 13) Product codes -> list
+    def split_codes(s):
+        if pd.isna(s):
+            return []
+        s = str(s).strip()
+        if s == "":
+            return []
+        s = s.replace("|", ",")
+        s = s.rstrip(",")
+        parts = [p.strip() for p in s.split(",") if p.strip()!='']
+        return parts
+    df['product_codes_list'] = df['product_codes'].apply(split_codes)
+
+    # 14) Feedback numeric (1-5)
+    def parse_feedback(x):
+        if pd.isna(x):
+            return pd.NA
+        s = str(x).strip().lower()
+        if s in ('n/a','no score','', 'nan'):
+            return pd.NA
+        # word-to-number common
+        word_map = {'one':1,'two':2,'three':3,'four':4,'five':5}
+        if s in word_map:
+            return word_map[s]
+        digits = re.search(r'([1-5])', s)
+        if digits:
+            return int(digits.group(1))
+        return pd.NA
+    df['feedback_score_clean'] = df['feedback_score'].apply(parse_feedback)
+
+    # 15) Canceled normalization
+    df['canceled_bool'] = df['canceled'].apply(normalize_bool_like)
+
+    # 16) Latitude/Longitude cleaning and swap detection
+    def to_float_latlon(s):
+        if pd.isna(s): return pd.NA
+        s2 = str(s).strip()
+        s2 = re.sub(r'[^0-9\.\-\+]', '', s2)
+        try:
+            return float(s2)
+        except:
+            return pd.NA
+    df['lat_num'] = df['latitude'].apply(to_float_latlon)
+    df['lon_num'] = df['longitude'].apply(to_float_latlon)
+    # detect out of range and attempt swap heuristics
+    mask_bad_lat = ~df['lat_num'].between(-90, 90) & df['lat_num'].notna()
+    mask_bad_lon = ~df['lon_num'].between(-180, 180) & df['lon_num'].notna()
+    # If lat is bad but lon looks like lat-range, swap
+    swap_mask = mask_bad_lat & df['lon_num'].between(-90, 90)
+    if swap_mask.any():
+        df.loc[swap_mask, ['lat_num', 'lon_num']] = df.loc[swap_mask, ['lon_num', 'lat_num']].values
+    # Set impossible values to NaN
+    df.loc[~df['lat_num'].between(-90, 90), 'lat_num'] = pd.NA
+    df.loc[~df['lon_num'].between(-180, 180), 'lon_num'] = pd.NA
+
+    # 17) Outlier detection for purchase_amount_clean - flagging only
+    p = df['purchase_amount_clean']
+    if p.dropna().size > 10:
+        q1 = p.quantile(0.25)
+        q3 = p.quantile(0.75)
+        iqr = q3 - q1
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        df['purchase_outlier'] = (~p.between(lower, upper)) & p.notna()
+    else:
+        df['purchase_outlier'] = False
+
+    # 18) Remove obviously empty columns or preserve original ones as needed
+    # (we'll keep originals and cleaned columns both for audit)
+
+    # 19) Final tidy: drop rows that are entirely empty in useful columns (optional)
+    useful_cols = ['id', 'name', 'email_clean', 'purchase_amount_clean']
+    # If desired, uncomment to drop rows with no useful info:
+    # df = df.dropna(subset=useful_cols, how='all')
+
+    # Return cleaned df
+    return df
+
+# ----------------------
+# Run pipeline
+# ----------------------
+def main():
+    print("Loading:", INPUT_CSV)
+    # Load everything as string to see raw issues (but pipeline handles types)
+    df_raw = pd.read_csv(INPUT_CSV, dtype=str)
+    print("Raw shape:", df_raw.shape)
+    df_clean = full_clean_pipeline(df_raw)
+
+    # Save cleaned file
+    df_clean.to_csv(OUTPUT_CSV, index=False)
+    print(f"Saved cleaned CSV to: {OUTPUT_CSV}")
+
+    # Print diagnostics
+    print("\n--- Diagnostics Summary ---")
+    print("Rows (raw):", len(df_raw))
+    print("Rows (cleaned, after dedupe/header removal):", len(df_clean))
+    print("Emails valid:", int(df_clean['email_valid'].sum()))
+    print("Emails missing/invalid:", int((~df_clean['email_valid']).sum()))
+    print("Purchase amounts parsed (non-null):", int(df_clean['purchase_amount_clean'].notna().sum()))
+    print("Income parsed (non-null):", int(df_clean['income_clean'].notna().sum()))
+    print("Duplicates removed:", len(df_raw) - len(df_clean))
+    print("Latitude valid:", int(df_clean['lat_num'].notna().sum()))
+    print("Longitude valid:", int(df_clean['lon_num'].notna().sum()))
+    print("Product codes with >=1 product:", int(df_clean['product_codes_list'].apply(len).gt(0).sum()))
+    if 'purchase_outlier' in df_clean.columns:
+        print("Purchase outliers flagged:", int(df_clean['purchase_outlier'].sum()))
+
+    # Show head of cleaned
+    print("\nSample cleaned rows (first 20):")
+    display_cols = [
+        'id','name','email_clean','phone_clean','country_clean',
+        'signup_date_parsed','last_login_parsed','age_clean','income_clean',
+        'purchase_amount_clean','purchase_outlier','product_codes_list','comments_clean'
+    ]
+    pd.set_option('display.max_columns', 50)
+    print(df_clean[display_cols].head(20).to_string(index=False))
+
+    # Short summary stats
+    print("\nSummary stats (numeric fields):")
+    print(df_clean[['age_clean','income_clean','purchase_amount_clean','feedback_score_clean']].describe(include='all'))
+
+    print("\nDone.")
+
+if __name__ == "__main__":
+    main()
